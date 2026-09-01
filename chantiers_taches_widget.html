@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chantiers &amp; Tâches</title>
+<script src="https://docs.getgrist.com/grist-plugin-api.js"></script>
+<style>
+  :root{
+    --bg:#f7f7f8; --card:#ffffff; --border:#e2e2e6; --text:#1f2328; --muted:#6b7280;
+    --accent:#2f6fed; --done-bg:#f4f6f8; --badge-bg:#eef1f7; --danger:#c0392b;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+       background:var(--bg);color:var(--text);font-size:14px;}
+  #toolbar{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:10px;align-items:center;
+           padding:10px 14px;background:var(--card);border-bottom:1px solid var(--border);}
+  #toolbar button{border:1px solid var(--border);background:#fff;border-radius:6px;padding:6px 10px;
+                   cursor:pointer;font-size:13px;}
+  #toolbar button:hover{background:#f0f2f5;}
+  #toolbar label{display:flex;align-items:center;gap:5px;font-size:13px;color:var(--muted);}
+  #searchBox{flex:1;min-width:160px;padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;}
+  #status{margin-left:auto;font-size:12px;color:var(--muted);}
+  #root{padding:14px;max-width:980px;margin:0 auto;}
+  .loading, .empty{color:var(--muted);padding:20px;text-align:center;}
+  details.chantier{background:var(--card);border:1px solid var(--border);border-radius:10px;
+                    margin-bottom:10px;overflow:hidden;}
+  details.chantier > summary{list-style:none;cursor:pointer;padding:12px 14px;display:flex;
+                              align-items:center;gap:10px;user-select:none;}
+  details.chantier > summary::-webkit-details-marker{display:none;}
+  .chevron{transition:transform .15s ease;color:var(--muted);font-size:11px;}
+  details[open] > summary .chevron{transform:rotate(90deg);}
+  .chantier-title{font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .chantier-projets{color:var(--muted);font-weight:400;font-size:12px;margin-left:6px;}
+  .count-badge{font-size:12px;color:var(--muted);background:var(--badge-bg);border-radius:999px;
+               padding:2px 9px;white-space:nowrap;}
+  .task-list{border-top:1px solid var(--border);}
+  .task-row{display:flex;align-items:center;gap:10px;padding:9px 14px;border-bottom:1px solid var(--border);
+             cursor:pointer;}
+  .task-row:last-child{border-bottom:none;}
+  .task-row:hover{background:#fafbfc;}
+  .task-row.done{background:var(--done-bg);}
+  .task-row.done .task-title{text-decoration:line-through;color:var(--muted);}
+  .task-row input[type=checkbox]{width:17px;height:17px;flex:none;cursor:pointer;}
+  .task-title{flex:1;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .task-date{flex:none;width:82px;color:var(--muted);font-variant-numeric:tabular-nums;}
+  .task-date.no-date{font-style:italic;opacity:.6;}
+  .task-resp{flex:none;width:110px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .badge{flex:none;font-size:11px;background:var(--badge-bg);border-radius:5px;padding:2px 6px;color:var(--text);}
+  .badge.prio{color:var(--danger);}
+  .empty-group{padding:12px 14px;color:var(--muted);font-style:italic;}
+  @media (prefers-color-scheme: dark){
+    :root{--bg:#1b1c1f;--card:#232427;--border:#33343a;--text:#e7e8ea;--muted:#9aa0a6;
+          --done-bg:#1f2023;--badge-bg:#2c2d31;}
+    #toolbar button{background:#232427;color:var(--text);}
+    #toolbar button:hover{background:#2c2d31;}
+  }
+</style>
+</head>
+<body>
+  <div id="toolbar">
+    <button id="btnExpandAll" type="button">Tout déplier</button>
+    <button id="btnCollapseAll" type="button">Tout replier</button>
+    <label><input type="checkbox" id="hideDone"> Masquer les tâches terminées</label>
+    <input type="search" id="searchBox" placeholder="Rechercher une tâche…">
+    <button id="btnRefresh" type="button" title="Recharger depuis Grist">⟳</button>
+    <span id="status"></span>
+  </div>
+  <div id="root"><p class="loading">Connexion à Grist…</p></div>
+
+<script>
+"use strict";
+
+/* ---- Noms des tables / colonnes utilisés (à adapter si le schéma Grist change) ---- */
+const T_CHANTIERS = "Chantiers";
+const T_TACHES = "Taches";
+const T_PERSONNES = "Personnes";
+const T_REFERENCES = "References";
+const T_PROJETS = "Projets";
+
+const root = document.getElementById("root");
+const statusEl = document.getElementById("status");
+const hideDoneEl = document.getElementById("hideDone");
+const searchEl = document.getElementById("searchBox");
+
+let tasksById = new Map();   // id -> task object
+let groupsOrdered = [];      // array of {id, label, projets, taskIds}
+let lastLoad = 0;
+
+function setStatus(msg) { statusEl.textContent = msg || ""; }
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+/* Décodage des valeurs brutes Grist : Reference simple = nombre (0 = vide),
+   Reference List / Choice List = ["L", v1, v2, ...] (ou null si vide). */
+function decodeRef(v) {
+  return (typeof v === "number" && v > 0) ? v : null;
+}
+function decodeRefList(v) {
+  if (Array.isArray(v) && v[0] === "L") {
+    return v.slice(1).filter(x => typeof x === "number" && x > 0);
+  }
+  return [];
+}
+
+/* Date_realisation est un champ Texte au format JJ/MM/AAAA (avec repli ISO AAAA-MM-JJ
+   au cas où). Renvoie une clé de tri numérique, ou null si non reconnue. */
+function parseDateKey(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  let m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
+  if (m) return (+m[3]) * 10000 + (+m[2]) * 100 + (+m[1]);
+  m = s.match(/^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})$/);
+  if (m) return (+m[1]) * 10000 + (+m[2]) * 100 + (+m[3]);
+  return null;
+}
+
+async function loadData() {
+  setStatus("Chargement…");
+  lastLoad = Date.now();
+  const [chantiers, taches, personnes, references, projets] = await Promise.all([
+    grist.docApi.fetchTable(T_CHANTIERS),
+    grist.docApi.fetchTable(T_TACHES),
+    grist.docApi.fetchTable(T_PERSONNES),
+    grist.docApi.fetchTable(T_REFERENCES),
+    grist.docApi.fetchTable(T_PROJETS),
+  ]);
+
+  const personnesMap = new Map(personnes.id.map((id, i) => [id, personnes.Nom[i]]));
+  const referencesMap = new Map(references.id.map((id, i) => [id, references.Type[i]]));
+  const projetsMap = new Map(projets.id.map((id, i) => [id, projets.Projet[i]]));
+
+  tasksById = new Map();
+  for (let i = 0; i < taches.id.length; i++) {
+    const id = taches.id[i];
+    tasksById.set(id, {
+      id,
+      tache: taches.Tache[i] || "(sans titre)",
+      commentaire: taches.Commentaire[i] || "",
+      dateRaw: taches.Date_realisation[i] || "",
+      dateKey: parseDateKey(taches.Date_realisation[i]),
+      prio: taches.Prio[i],
+      termine: !!taches.Termine[i],
+      responsable: personnesMap.get(decodeRef(taches.Responsable[i])) || "",
+      type: referencesMap.get(decodeRef(taches.Type[i])) || "",
+      chantierIds: decodeRefList(taches.Chantier[i]),
+    });
+  }
+
+  const groups = new Map();
+  for (let i = 0; i < chantiers.id.length; i++) {
+    const id = chantiers.id[i];
+    groups.set(id, {
+      id,
+      label: chantiers.Chantier[i] || `Chantier #${id}`,
+      projets: decodeRefList(chantiers.Projets ? chantiers.Projets[i] : null)
+        .map(pid => projetsMap.get(pid)).filter(Boolean),
+      taskIds: [],
+    });
+  }
+  const sansChantier = { id: "none", label: "Sans chantier", projets: [], taskIds: [] };
+
+  for (const task of tasksById.values()) {
+    if (task.chantierIds.length === 0) {
+      sansChantier.taskIds.push(task.id);
+      continue;
+    }
+    for (const cid of task.chantierIds) {
+      const g = groups.get(cid);
+      if (g) g.taskIds.push(task.id);
+    }
+  }
+
+  groupsOrdered = Array.from(groups.values())
+    .sort((a, b) => a.label.localeCompare(b.label, "fr", { sensitivity: "base" }));
+  if (sansChantier.taskIds.length) groupsOrdered.push(sansChantier);
+
+  render();
+  setStatus("Mis à jour à " + new Date().toLocaleTimeString("fr-FR"));
+}
+
+function currentOpenIds() {
+  const open = new Set();
+  root.querySelectorAll("details.chantier[open]").forEach(d => open.add(d.dataset.chantierId));
+  return open;
+}
+
+function render() {
+  const isFirstRender = root.querySelector("details.chantier") === null;
+  const openIds = isFirstRender ? null : currentOpenIds();
+  const hideDone = hideDoneEl.checked;
+  const query = searchEl.value.trim().toLowerCase();
+
+  root.innerHTML = "";
+  if (groupsOrdered.length === 0) {
+    root.innerHTML = '<p class="empty">Aucun chantier trouvé.</p>';
+    return;
+  }
+
+  for (const g of groupsOrdered) {
+    let tasks = g.taskIds.map(id => tasksById.get(id)).filter(Boolean);
+    if (hideDone) tasks = tasks.filter(t => !t.termine);
+    if (query) tasks = tasks.filter(t => t.tache.toLowerCase().includes(query));
+    tasks.sort((a, b) => {
+      const ka = a.dateKey ?? Infinity, kb = b.dateKey ?? Infinity;
+      if (ka !== kb) return ka - kb;
+      return a.tache.localeCompare(b.tache, "fr", { sensitivity: "base" });
+    });
+
+    const totalCount = g.taskIds.length;
+    const doneCount = g.taskIds.map(id => tasksById.get(id)).filter(t => t && t.termine).length;
+
+    const details = document.createElement("details");
+    details.className = "chantier";
+    details.dataset.chantierId = String(g.id);
+    details.open = openIds ? openIds.has(String(g.id)) : true;
+
+    const projetsTxt = g.projets.length ? ` <span class="chantier-projets">(${escapeHtml(g.projets.join(", "))})</span>` : "";
+    details.innerHTML = `
+      <summary>
+        <span class="chevron">▶</span>
+        <span class="chantier-title">${escapeHtml(g.label)}${projetsTxt}</span>
+        <span class="count-badge">${doneCount}/${totalCount} terminées</span>
+      </summary>
+      <div class="task-list"></div>
+    `;
+
+    const list = details.querySelector(".task-list");
+    if (tasks.length === 0) {
+      list.innerHTML = `<div class="empty-group">Aucune tâche${(hideDone || query) ? " (avec les filtres actuels)" : ""}.</div>`;
+    } else {
+      for (const t of tasks) {
+        const row = document.createElement("label");
+        row.className = "task-row" + (t.termine ? " done" : "");
+        row.dataset.taskId = String(t.id);
+        if (t.commentaire) row.title = t.commentaire;
+        row.innerHTML = `
+          <input type="checkbox" ${t.termine ? "checked" : ""} data-id="${t.id}">
+          <span class="task-title">${escapeHtml(t.tache)}</span>
+          <span class="task-date${t.dateKey ? "" : " no-date"}">${escapeHtml(t.dateRaw || "sans date")}</span>
+          <span class="task-resp">${escapeHtml(t.responsable)}</span>
+          ${(t.prio !== null && t.prio !== undefined && t.prio !== "") ? `<span class="badge prio">P${escapeHtml(t.prio)}</span>` : ""}
+          ${t.type ? `<span class="badge">${escapeHtml(t.type)}</span>` : ""}
+        `;
+        list.appendChild(row);
+      }
+    }
+    root.appendChild(details);
+  }
+}
+
+async function toggleTermine(id, val) {
+  const task = tasksById.get(id);
+  if (!task) return;
+  const prev = task.termine;
+  task.termine = val;
+  const rowEl = root.querySelector(`.task-row[data-task-id="${id}"]`);
+  if (rowEl) rowEl.classList.toggle("done", val);
+  try {
+    await grist.docApi.applyUserActions([["UpdateRecord", T_TACHES, id, { Termine: val }]]);
+  } catch (e) {
+    task.termine = prev;
+    if (rowEl) {
+      rowEl.classList.toggle("done", prev);
+      const cb = rowEl.querySelector("input[type=checkbox]");
+      if (cb) cb.checked = prev;
+    }
+    alert("Échec de la mise à jour dans Grist : " + (e && e.message ? e.message : e));
+  }
+}
+
+root.addEventListener("change", (ev) => {
+  const cb = ev.target.closest('input[type="checkbox"][data-id]');
+  if (!cb) return;
+  toggleTermine(Number(cb.dataset.id), cb.checked);
+});
+
+document.getElementById("btnExpandAll").addEventListener("click", () => {
+  root.querySelectorAll("details.chantier").forEach(d => d.open = true);
+});
+document.getElementById("btnCollapseAll").addEventListener("click", () => {
+  root.querySelectorAll("details.chantier").forEach(d => d.open = false);
+});
+document.getElementById("btnRefresh").addEventListener("click", () => loadData().catch(reportError));
+hideDoneEl.addEventListener("change", render);
+searchEl.addEventListener("input", () => { render(); });
+
+function reportError(e) {
+  console.error(e);
+  setStatus("Erreur : " + (e && e.message ? e.message : e));
+}
+
+/* Rafraîchissement : quand des données changent dans la table à laquelle le widget
+   est rattaché, et en secours toutes les 30s / au retour sur l'onglet. */
+grist.onRecords(() => { loadData().catch(reportError); });
+window.addEventListener("focus", () => {
+  if (Date.now() - lastLoad > 5000) loadData().catch(reportError);
+});
+setInterval(() => loadData().catch(reportError), 30000);
+
+grist.ready({ requiredAccess: "full" });
+loadData().catch(reportError);
+</script>
+</body>
+</html>
